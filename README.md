@@ -1,4 +1,16 @@
 
+## About this fork
+
+This repository is a pinned fork of [`inet-tub/ns3-datacenter`](https://github.com/inet-tub/ns3-datacenter), maintained for use by the [Doppelgänger](https://github.com/provandal/doppelganger) project (the NS-3 Substrate Adapter for [HarnessIT](https://github.com/provandal/harnessit)). Doppelgänger pins to commit `4dd55d89a46e742e505a92dc7873f82ded6db638` (master HEAD as of 2026-05-02, the date of the Doppelgänger fork spike).
+
+### License clarification
+
+The upstream `inet-tub/ns3-datacenter` ships [`simulator/ns-3.39/LICENSE`](simulator/ns-3.39/LICENSE) (GPL-2.0) with the vendored NS-3.39 source but does not declare a top-level repository license. Because the inet-tub additions (PowerTCP, ABM, Reverie, Credence) are derivative works of NS-3 (linked at compile time), they fall under GPL-2.0 by inheritance. This fork makes that explicit by adding a top-level [`LICENSE`](LICENSE) file (GPL-2.0).
+
+This is a fork-only license clarification. No changes are made to the substantive code; downstream consumers are encouraged to send patches upstream first.
+
+---
+
 # ns3-datacenter
 
 This repository contains the source code used for the following papers: 
