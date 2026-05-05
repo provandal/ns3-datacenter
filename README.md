@@ -1,13 +1,21 @@
 
 ## About this fork
 
-This repository is a pinned fork of [`inet-tub/ns3-datacenter`](https://github.com/inet-tub/ns3-datacenter), maintained for use by the [Doppelgänger](https://github.com/provandal/doppelganger) project (the NS-3 Substrate Adapter for [HarnessIT](https://github.com/provandal/harnessit)). Doppelgänger pins to commit `4dd55d89a46e742e505a92dc7873f82ded6db638` (master HEAD as of 2026-05-02, the date of the Doppelgänger fork spike).
+This repository is a pinned fork of [`inet-tub/ns3-datacenter`](https://github.com/inet-tub/ns3-datacenter), maintained for use by the [Doppelgänger](https://github.com/provandal/doppelganger) project (the NS-3 Substrate Adapter for [HarnessIT](https://github.com/provandal/harnessit)).
 
 ### License clarification
 
 The upstream `inet-tub/ns3-datacenter` ships [`simulator/ns-3.39/LICENSE`](simulator/ns-3.39/LICENSE) (GPL-2.0) with the vendored NS-3.39 source but does not declare a top-level repository license. Because the inet-tub additions (PowerTCP, ABM, Reverie, Credence) are derivative works of NS-3 (linked at compile time), they fall under GPL-2.0 by inheritance. This fork makes that explicit by adding a top-level [`LICENSE`](LICENSE) file (GPL-2.0).
 
-This is a fork-only license clarification. No changes are made to the substantive code; downstream consumers are encouraged to send patches upstream first.
+### Substrate fixes (2026-05-05)
+
+`examples/PowerTCP/powertcp-evaluation-burst.cc` upstream had three trace-output features whose runtime wiring was missing or commented out. Each was investigated by reading the source at the pinned SHA (4dd55d8…) and is fixed in this fork:
+
+1. **`pfc.txt` was empty.** The file was opened and the `get_pfc` callback existed, but the two `TraceConnectWithoutContext("QbbPfc", …)` calls that feed the file were commented out. Re-enabled.
+2. **`mix.tr` was empty.** The `trace_output_file` config value was parsed and stored but never used; the standard NS-3 `AsciiTraceHelper` block was commented out. Re-enabled, with the original hardcoded `"eval.tr"` replaced by `trace_output_file` so the `TRACE_OUTPUT_FILE` config takes effect.
+3. **`qlen.txt` was empty.** `monitor_buffer()` was defined and self-rescheduling, but no initial `Simulator::Schedule` call kicked it off and `qlen_mon_file` was never opened. Added the missing `fopen` and the initial `Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, …)` near `Simulator::Run()`.
+
+These fixes are intended to be sent upstream to `inet-tub/ns3-datacenter` once exercised in the Doppelgänger build.
 
 ---
 

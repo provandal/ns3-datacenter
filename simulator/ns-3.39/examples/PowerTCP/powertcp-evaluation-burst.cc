@@ -911,9 +911,12 @@ int main(int argc, char *argv[])
 		ipv4.SetBase(ipstring.str().c_str(), "255.255.255.0");
 		ipv4.Assign(d);
 
-		// setup PFC trace
-		// DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
-		// DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(1))));
+		// setup PFC trace (re-enabled by provandal/ns3-datacenter fix
+		// 2026-05-05: pfc.txt was empty in upstream because these two
+		// TraceConnectWithoutContext calls were commented out, leaving
+		// pfc_file open but unfed. The get_pfc callback above is intact.)
+		DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
+		DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(1))));
 	}
 
 	nic_rate = get_nic_rate(n);
@@ -1084,8 +1087,28 @@ int main(int argc, char *argv[])
 	double delay = 1.5 * minRtt * 1e-9; // 10 micro seconds
 	Simulator::Schedule(Seconds(delay), PrintResults, switchDown, 1, delay);
 
-	// AsciiTraceHelper ascii;
-	//     qbb.EnableAsciiAll (ascii.CreateFileStream ("eval.tr"));
+	// AsciiTraceHelper for mix.tr — re-enabled by provandal/ns3-datacenter
+	// fix 2026-05-05. Upstream had this commented and trace_output_file
+	// went unused (parsed and stored, never opened). The substitution
+	// from the original hardcoded "eval.tr" to trace_output_file lets
+	// the config's TRACE_OUTPUT_FILE actually take effect.
+	AsciiTraceHelper ascii;
+	qbb.EnableAsciiAll(ascii.CreateFileStream(trace_output_file));
+
+	// Open qlen monitoring output file and schedule the initial
+	// monitor_buffer call. Provandal/ns3-datacenter fix 2026-05-05:
+	// upstream had monitor_buffer() defined and self-rescheduling
+	// (line 208), but no initial Schedule call and no fopen — so
+	// qlen.txt was always empty regardless of QLEN_MON_FILE /
+	// QLEN_MON_START / QLEN_MON_END config values.
+	FILE *qlen_output = nullptr;
+	if (!qlen_mon_file.empty()) {
+		qlen_output = fopen(qlen_mon_file.c_str(), "w");
+		if (qlen_output) {
+			Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output, &n);
+		}
+	}
+
 	std::cout << "Running Simulation.\n";
 	NS_LOG_INFO("Run Simulation.");
 	Simulator::Stop(Seconds(simulator_stop_time));
