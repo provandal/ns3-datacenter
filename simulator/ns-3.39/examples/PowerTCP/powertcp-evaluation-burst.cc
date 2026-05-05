@@ -523,10 +523,14 @@ int main(int argc, char *argv[])
 			std::string v;
 			conf >> v;
 			trace_output_file = v;
-			if (argc > 2)
-			{
-				trace_output_file = trace_output_file + std::string(argv[2]);
-			}
+			// Upstream had `if (argc > 2) trace_output_file += argv[2];`
+			// here, which mutated the filename when extra cmd-line args
+			// were present (e.g., "--algorithm=3" produced
+			// "mix.tr--algorithm=3"). Removed by provandal/ns3-datacenter
+			// 2026-05-05 because it's surprise behavior with no documented
+			// purpose and breaks downstream consumers (Doppelgänger Driver)
+			// that pass --algorithm explicitly to defeat the silent
+			// CC_MODE override at line 717.
 			std::cout << "TRACE_OUTPUT_FILE\t\t" << trace_output_file << "\n";
 		}
 		else if (key.compare("SIMULATOR_STOP_TIME") == 0)

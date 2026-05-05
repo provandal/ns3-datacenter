@@ -9,11 +9,12 @@ The upstream `inet-tub/ns3-datacenter` ships [`simulator/ns-3.39/LICENSE`](simul
 
 ### Substrate fixes (2026-05-05)
 
-`examples/PowerTCP/powertcp-evaluation-burst.cc` upstream had three trace-output features whose runtime wiring was missing or commented out. Each was investigated by reading the source at the pinned SHA (4dd55d8…) and is fixed in this fork:
+`examples/PowerTCP/powertcp-evaluation-burst.cc` upstream had several trace-output and command-line-handling issues whose runtime wiring was missing, commented out, or surprising. Each was investigated by reading the source at the pinned SHA (4dd55d8…) and is fixed in this fork:
 
 1. **`pfc.txt` was empty.** The file was opened and the `get_pfc` callback existed, but the two `TraceConnectWithoutContext("QbbPfc", …)` calls that feed the file were commented out. Re-enabled.
 2. **`mix.tr` was empty.** The `trace_output_file` config value was parsed and stored but never used; the standard NS-3 `AsciiTraceHelper` block was commented out. Re-enabled, with the original hardcoded `"eval.tr"` replaced by `trace_output_file` so the `TRACE_OUTPUT_FILE` config takes effect.
 3. **`qlen.txt` was empty.** `monitor_buffer()` was defined and self-rescheduling, but no initial `Simulator::Schedule` call kicked it off and `qlen_mon_file` was never opened. Added the missing `fopen` and the initial `Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, …)` near `Simulator::Run()`.
+4. **`TRACE_OUTPUT_FILE` filename mutation.** The parser had `if (argc > 2) trace_output_file += argv[2]`, which made the mix.tr filename mutate based on extra cmd-line args. Removed: surprise behavior with no documented purpose that broke downstream consumers passing `--algorithm` to defeat the silent `CC_MODE` override at line 717.
 
 These fixes are intended to be sent upstream to `inet-tub/ns3-datacenter` once exercised in the Doppelgänger build.
 
