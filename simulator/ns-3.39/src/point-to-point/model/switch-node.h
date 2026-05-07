@@ -57,6 +57,13 @@ public:
 	// for approximate calc in PINT
 	int logres_shift(int b, int l);
 	int log2apprx(int x, int b, int m, int l); // given x of at most b bits, use most significant m bits of x, calc the result in l bits
+
+	// EcnMark trace source: fires when the switch stamps a packet's IPv4
+	// ECN field with CE (0x03) at egress. Args: (ifIndex, qIndex). Symmetric
+	// to QbbPfc on QbbNetDevice; provided so eval tooling can read CE-mark
+	// counts as a sibling to PFC pause counts. Added by provandal/ns3-datacenter
+	// for the counter-asymmetry diagnostic (HarnessIT Stage 5a, 2026-05-08).
+	TracedCallback<uint32_t, uint32_t> m_traceEcnMark;
 };
 
 } /* namespace ns3 */

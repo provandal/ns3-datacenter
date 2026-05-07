@@ -50,6 +50,7 @@ double pause_time = 5, simulator_stop_time = 3.01;
 std::string data_rate, link_delay, topology_file, flow_file, trace_file, trace_output_file;
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
+std::string ecn_output_file = "ecn.txt";
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -192,6 +193,13 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 
 void get_pfc(FILE* fout, Ptr<QbbNetDevice> dev, uint32_t type) {
 	fprintf(fout, "%lu %u %u %u %u\n", Simulator::Now().GetTimeStep(), dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(), dev->GetIfIndex(), type);
+}
+
+// Per-CE-stamp callback. Writes one line per packet that the switch egress
+// stamped with CE (ECN-CN). Provided so eval tooling can read mark counts
+// as a sibling to PFC pause counts. See switch-node EcnMark trace source.
+void get_ecn(FILE* fout, Ptr<SwitchNode> sw, uint32_t ifIndex, uint32_t qIndex) {
+	fprintf(fout, "%lu %u %u %u\n", Simulator::Now().GetTimeStep(), sw->GetId(), ifIndex, qIndex);
 }
 
 struct QlenDistribution {
@@ -642,6 +650,9 @@ int main(int argc, char *argv[])
 		} else if (key.compare("PFC_OUTPUT_FILE") == 0) {
 			conf >> pfc_output_file;
 			std::cout << "PFC_OUTPUT_FILE\t\t\t\t" << pfc_output_file << '\n';
+		} else if (key.compare("ECN_OUTPUT_FILE") == 0) {
+			conf >> ecn_output_file;
+			std::cout << "ECN_OUTPUT_FILE\t\t\t\t" << ecn_output_file << '\n';
 		} else if (key.compare("LINK_DOWN") == 0) {
 			conf >> link_down_time >> link_down_A >> link_down_B;
 			std::cout << "LINK_DOWN\t\t\t\t" << link_down_time << ' ' << link_down_A << ' ' << link_down_B << '\n';
@@ -831,6 +842,7 @@ int main(int argc, char *argv[])
 	rem->SetAttribute("ErrorUnit", StringValue("ERROR_UNIT_PACKET"));
 
 	FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
+	FILE *ecn_file = fopen(ecn_output_file.c_str(), "w");
 
 	QbbHelper qbb;
 	Ipv4AddressHelper ipv4;
@@ -957,6 +969,11 @@ int main(int argc, char *argv[])
 			sw->m_mmu->SetIngressPool(buffer_size * 1024 * 1024);
 			sw->m_mmu->SetEgressLosslessPool(buffer_size * 1024 * 1024);
 			sw->m_mmu->node_id = sw->GetId();
+
+			// setup ECN-mark trace (provandal/ns3-datacenter HarnessIT Stage 5a,
+			// 2026-05-08): one line in ecn.txt per CE-stamp event at switch egress.
+			// Symmetric to the QbbPfc tracing wired in the link-creation loop above.
+			sw->TraceConnectWithoutContext("EcnMark", MakeBoundCallback(&get_ecn, ecn_file, sw));
 		}
 	}
 

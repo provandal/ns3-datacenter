@@ -50,6 +50,10 @@ TypeId SwitchNode::GetTypeId (void)
 	                                  BooleanValue(false),
 	                                  MakeBooleanAccessor(&SwitchNode::PowerEnabled),
 	                                  MakeBooleanChecker())
+	                    .AddTraceSource("EcnMark",
+	                                    "A packet's CE bit was stamped at switch egress (ECN-CN). Args: ifIndex, qIndex.",
+	                                    MakeTraceSourceAccessor(&SwitchNode::m_traceEcnMark),
+	                                    "ns3::SwitchNode::EcnMarkTracedCallback")
 
 	                    ;
 	return tid;
@@ -255,6 +259,7 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 				h.SetEcn((Ipv4Header::EcnType)0x03);
 				p->AddHeader(h);
 				p->AddHeader(ppp);
+				m_traceEcnMark(ifIndex, qIndex);
 			}
 		}
 		//CheckAndSendPfc(inDev, qIndex);
