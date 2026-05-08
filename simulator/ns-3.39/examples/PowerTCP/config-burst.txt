@@ -10,6 +10,7 @@ TRACE_OUTPUT_FILE mix/mix.tr
 FCT_OUTPUT_FILE mix/fct.txt
 PFC_OUTPUT_FILE mix/pfc.txt
 ECN_OUTPUT_FILE mix/ecn.txt
+COUNTERS_OUTPUT_FILE mix/counters.txt
 
 SIMULATOR_STOP_TIME 0.2
 

@@ -20,6 +20,9 @@
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
+#include <map>
+#include <set>
+#include <utility>
 #include <time.h>
 #include "ns3/core-module.h"
 #include "ns3/qbb-helper.h"
@@ -51,6 +54,7 @@ std::string data_rate, link_delay, topology_file, flow_file, trace_file, trace_o
 std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
 std::string ecn_output_file = "ecn.txt";
+std::string counters_output_file = "counters.txt";
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -200,6 +204,42 @@ void get_pfc(FILE* fout, Ptr<QbbNetDevice> dev, uint32_t type) {
 // as a sibling to PFC pause counts. See switch-node EcnMark trace source.
 void get_ecn(FILE* fout, Ptr<SwitchNode> sw, uint32_t ifIndex, uint32_t qIndex) {
 	fprintf(fout, "%lu %u %u %u\n", Simulator::Now().GetTimeStep(), sw->GetId(), ifIndex, qIndex);
+}
+
+// Per-port counter rollup. Keys: (switch_node_id, ifIndex). Populated by
+// QbbEnqueue/QbbDequeue/QbbDrop trace callbacks during sim and written to
+// counters.txt as cumulative end-of-sim rollups (one row per switch port).
+// Distinct from per-event pfc.txt/ecn.txt: this is the SNMP-style snapshot
+// real switches expose via interface counters. Provandal/ns3-datacenter
+// HarnessIT Stage 5a-realistic, 2026-05-09.
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_rx_packets;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_rx_bytes;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_tx_packets;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_tx_bytes;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_drops;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_qlen_peak_bytes;
+
+void on_port_enqueue(uint32_t switch_id, uint32_t if_index, Ptr<QbbNetDevice> dev,
+                     Ptr<const Packet> p, uint32_t /*qIndex*/) {
+	auto k = std::make_pair(switch_id, if_index);
+	port_rx_packets[k]++;
+	port_rx_bytes[k] += p->GetSize();
+	uint64_t qbytes = dev->GetQueue()->GetNBytesTotal();
+	uint64_t& peak = port_qlen_peak_bytes[k];
+	if (qbytes > peak) peak = qbytes;
+}
+
+void on_port_dequeue(uint32_t switch_id, uint32_t if_index,
+                     Ptr<const Packet> p, uint32_t /*qIndex*/) {
+	auto k = std::make_pair(switch_id, if_index);
+	port_tx_packets[k]++;
+	port_tx_bytes[k] += p->GetSize();
+}
+
+void on_port_drop(uint32_t switch_id, uint32_t if_index,
+                  Ptr<const Packet> p, uint32_t /*qIndex*/) {
+	auto k = std::make_pair(switch_id, if_index);
+	port_drops[k]++;
 }
 
 struct QlenDistribution {
@@ -653,6 +693,9 @@ int main(int argc, char *argv[])
 		} else if (key.compare("ECN_OUTPUT_FILE") == 0) {
 			conf >> ecn_output_file;
 			std::cout << "ECN_OUTPUT_FILE\t\t\t\t" << ecn_output_file << '\n';
+		} else if (key.compare("COUNTERS_OUTPUT_FILE") == 0) {
+			conf >> counters_output_file;
+			std::cout << "COUNTERS_OUTPUT_FILE\t\t\t" << counters_output_file << '\n';
 		} else if (key.compare("LINK_DOWN") == 0) {
 			conf >> link_down_time >> link_down_A >> link_down_B;
 			std::cout << "LINK_DOWN\t\t\t\t" << link_down_time << ' ' << link_down_A << ' ' << link_down_B << '\n';
@@ -843,6 +886,7 @@ int main(int argc, char *argv[])
 
 	FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
 	FILE *ecn_file = fopen(ecn_output_file.c_str(), "w");
+	FILE *counters_file = fopen(counters_output_file.c_str(), "w");
 
 	QbbHelper qbb;
 	Ipv4AddressHelper ipv4;
@@ -947,6 +991,22 @@ int main(int argc, char *argv[])
 			sw->m_mmu->SetAlphaEgress(UINT16_MAX);
 			uint64_t totalHeadroom = 0;
 			for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
+
+				// Wire per-port counter trace callbacks (Stage 5a-realistic).
+				// Hooks QbbEnqueue/QbbDequeue/QbbDrop on each switch port so
+				// rx/tx packets+bytes, drops, and queue-depth peak accumulate
+				// in the side maps for end-of-sim emission to counters.txt.
+				{
+					Ptr<QbbNetDevice> port_dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
+					uint32_t sw_id = sw->GetId();
+					uint32_t if_idx = port_dev->GetIfIndex();
+					port_dev->TraceConnectWithoutContext("QbbEnqueue",
+						MakeBoundCallback(&on_port_enqueue, sw_id, if_idx, port_dev));
+					port_dev->TraceConnectWithoutContext("QbbDequeue",
+						MakeBoundCallback(&on_port_dequeue, sw_id, if_idx));
+					port_dev->TraceConnectWithoutContext("QbbDrop",
+						MakeBoundCallback(&on_port_drop, sw_id, if_idx));
+				}
 
 				for (uint32_t qu = 0; qu < 8; qu++) {
 					Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
@@ -1134,6 +1194,28 @@ int main(int argc, char *argv[])
 	NS_LOG_INFO("Run Simulation.");
 	Simulator::Stop(Seconds(simulator_stop_time));
 	Simulator::Run();
+
+	// Emit per-port counter rollup (Stage 5a-realistic). One row per (switch,
+	// port) observed during simulation. Columns: switch_id if_index rx_packets
+	// rx_bytes tx_packets tx_bytes drops qlen_peak_bytes. Only switch ports
+	// emit counters (host ports are filtered out at trace-connect time).
+	{
+		std::set<std::pair<uint32_t, uint32_t>> keys;
+		for (auto& kv : port_rx_packets) keys.insert(kv.first);
+		for (auto& kv : port_tx_packets) keys.insert(kv.first);
+		for (auto& kv : port_drops) keys.insert(kv.first);
+		for (auto& kv : port_qlen_peak_bytes) keys.insert(kv.first);
+		for (auto& k : keys) {
+			fprintf(counters_file, "%u %u %lu %lu %lu %lu %lu %lu\n",
+				k.first, k.second,
+				port_rx_packets[k], port_rx_bytes[k],
+				port_tx_packets[k], port_tx_bytes[k],
+				port_drops[k], port_qlen_peak_bytes[k]);
+		}
+		fflush(counters_file);
+		fclose(counters_file);
+	}
+
 	Simulator::Destroy();
 	NS_LOG_INFO("Done.");
 	endt = clock();
