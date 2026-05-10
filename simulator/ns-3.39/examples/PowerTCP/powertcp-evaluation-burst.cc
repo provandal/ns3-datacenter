@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <map>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <time.h>
 #include "ns3/core-module.h"
@@ -195,8 +196,18 @@ void qp_finish(FILE* fout, Ptr<RdmaQueuePair> q) {
 	rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
 }
 
-void get_pfc(FILE* fout, Ptr<QbbNetDevice> dev, uint32_t type) {
-	fprintf(fout, "%lu %u %u %u %u\n", Simulator::Now().GetTimeStep(), dev->GetNode()->GetId(), dev->GetNode()->GetNodeType(), dev->GetIfIndex(), type);
+// Per-PFC-frame callback (per-priority). Writes one row per pause/resume
+// frame including the 802.1p priority (qIndex). Format extended 2026-05-10
+// for SONiC-shaped per-priority PFC reporting (Stage 5a-realistic
+// SONiC counter expansion). Old 5-column format dropped — Doppelgänger
+// is the only consumer of this fork's output, and it expects the new shape.
+void get_pfc(FILE* fout, Ptr<QbbNetDevice> dev, uint32_t type, uint32_t qIndex) {
+	fprintf(fout, "%lu %u %u %u %u %u\n",
+	        Simulator::Now().GetTimeStep(),
+	        dev->GetNode()->GetId(),
+	        dev->GetNode()->GetNodeType(),
+	        dev->GetIfIndex(),
+	        type, qIndex);
 }
 
 // Per-CE-stamp callback. Writes one line per packet that the switch egress
@@ -206,40 +217,76 @@ void get_ecn(FILE* fout, Ptr<SwitchNode> sw, uint32_t ifIndex, uint32_t qIndex) 
 	fprintf(fout, "%lu %u %u %u\n", Simulator::Now().GetTimeStep(), sw->GetId(), ifIndex, qIndex);
 }
 
-// Per-port counter rollup. Keys: (switch_node_id, ifIndex). Populated by
-// QbbEnqueue/QbbDequeue/QbbDrop trace callbacks during sim and written to
-// counters.txt as cumulative end-of-sim rollups (one row per switch port).
-// Distinct from per-event pfc.txt/ecn.txt: this is the SNMP-style snapshot
-// real switches expose via interface counters. Provandal/ns3-datacenter
-// HarnessIT Stage 5a-realistic, 2026-05-09.
-std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_rx_packets;
-std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_rx_bytes;
-std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_tx_packets;
-std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_tx_bytes;
-std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_drops;
-std::map<std::pair<uint32_t, uint32_t>, uint64_t> port_qlen_peak_bytes;
+// Per-(switch, port, qIndex) counter rollup keyed by triple. Populated by
+// QbbEnqueue / QbbDequeue / QbbDrop trace callbacks (per-priority) during
+// the run, and by a periodic sampler (sample_watermarks) that walks the
+// switch MMU every 100us tracking egress queue and ingress PG depth peaks.
+// Written to counters.txt at end of sim as the SNMP-style cumulative
+// snapshot real switches expose via per-priority queue + PFC counters.
+// SONiC alignment: matches the columns from `show queue counters`,
+// `show queue watermark`, and `show priority-group watermark`. Provandal/
+// ns3-datacenter HarnessIT Stage 5a-realistic SONiC expansion, 2026-05-10.
+using PortQKey = std::tuple<uint32_t, uint32_t, uint32_t>;  // (switch_id, if_index, q_index)
+std::map<PortQKey, uint64_t> portq_rx_packets;
+std::map<PortQKey, uint64_t> portq_rx_bytes;
+std::map<PortQKey, uint64_t> portq_tx_packets;
+std::map<PortQKey, uint64_t> portq_tx_bytes;
+std::map<PortQKey, uint64_t> portq_drops;
+std::map<PortQKey, uint64_t> portq_qlen_peak_bytes;
+std::map<PortQKey, uint64_t> portq_pg_watermark_bytes;
 
-void on_port_enqueue(uint32_t switch_id, uint32_t if_index, Ptr<QbbNetDevice> dev,
-                     Ptr<const Packet> p, uint32_t /*qIndex*/) {
-	auto k = std::make_pair(switch_id, if_index);
-	port_rx_packets[k]++;
-	port_rx_bytes[k] += p->GetSize();
-	uint64_t qbytes = dev->GetQueue()->GetNBytesTotal();
-	uint64_t& peak = port_qlen_peak_bytes[k];
-	if (qbytes > peak) peak = qbytes;
+void on_portq_enqueue(uint32_t switch_id, uint32_t if_index,
+                      Ptr<const Packet> p, uint32_t qIndex) {
+	auto k = std::make_tuple(switch_id, if_index, qIndex);
+	portq_rx_packets[k]++;
+	portq_rx_bytes[k] += p->GetSize();
 }
 
-void on_port_dequeue(uint32_t switch_id, uint32_t if_index,
-                     Ptr<const Packet> p, uint32_t /*qIndex*/) {
-	auto k = std::make_pair(switch_id, if_index);
-	port_tx_packets[k]++;
-	port_tx_bytes[k] += p->GetSize();
+void on_portq_dequeue(uint32_t switch_id, uint32_t if_index,
+                      Ptr<const Packet> p, uint32_t qIndex) {
+	auto k = std::make_tuple(switch_id, if_index, qIndex);
+	portq_tx_packets[k]++;
+	portq_tx_bytes[k] += p->GetSize();
 }
 
-void on_port_drop(uint32_t switch_id, uint32_t if_index,
-                  Ptr<const Packet> p, uint32_t /*qIndex*/) {
-	auto k = std::make_pair(switch_id, if_index);
-	port_drops[k]++;
+void on_portq_drop(uint32_t switch_id, uint32_t if_index,
+                   Ptr<const Packet> p, uint32_t qIndex) {
+	auto k = std::make_tuple(switch_id, if_index, qIndex);
+	portq_drops[k]++;
+}
+
+// Sampler scheduled every WATERMARK_SAMPLE_NS: walk every switch's MMU and
+// update per-(switch, port, qIndex) max watermarks for both egress queue
+// depth (`m_mmu->egress_bytes`) and ingress priority-group buffer
+// occupancy (`m_mmu->ingress_bytes`). Re-schedules itself recursively;
+// stops at simulation end. Sampling overhead is bounded by switches *
+// ports * 8 queues per tick — for a 4-leaf 1-spine 4-host fabric that's
+// 5 switches * ~8 ports * 8 queues = 320 reads per 100us = 3.2M reads/s,
+// negligible. Provandal/ns3-datacenter Stage 5a-realistic SONiC.
+const uint64_t WATERMARK_SAMPLE_NS = 100000;  // 100 microseconds
+
+void sample_watermarks(NodeContainer *nodes) {
+	for (uint32_t i = 0; i < nodes->GetN(); i++) {
+		Ptr<Node> node = nodes->Get(i);
+		if (node->GetNodeType() != 1) continue;  // switches only
+		Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(node);
+		uint32_t sw_id = sw->GetId();
+		for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
+			for (uint32_t q = 0; q < SwitchMmu::qCnt; q++) {
+				auto k = std::make_tuple(sw_id, j, q);
+				uint64_t eg = sw->m_mmu->egress_bytes[j][q];
+				uint64_t& egpeak = portq_qlen_peak_bytes[k];
+				if (eg > egpeak) egpeak = eg;
+				uint64_t in = sw->m_mmu->ingress_bytes[j][q];
+				uint64_t& inpeak = portq_pg_watermark_bytes[k];
+				if (in > inpeak) inpeak = in;
+			}
+		}
+	}
+	if (Simulator::Now() < Simulator::GetMaximumSimulationTime()) {
+		Simulator::Schedule(NanoSeconds(WATERMARK_SAMPLE_NS),
+		                    &sample_watermarks, nodes);
+	}
 }
 
 struct QlenDistribution {
@@ -971,12 +1018,15 @@ int main(int argc, char *argv[])
 		ipv4.SetBase(ipstring.str().c_str(), "255.255.255.0");
 		ipv4.Assign(d);
 
-		// setup PFC trace (re-enabled by provandal/ns3-datacenter fix
-		// 2026-05-05: pfc.txt was empty in upstream because these two
-		// TraceConnectWithoutContext calls were commented out, leaving
-		// pfc_file open but unfed. The get_pfc callback above is intact.)
-		DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
-		DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext("QbbPfc", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(1))));
+		// setup PFC trace. Re-enabled by provandal/ns3-datacenter fix
+		// 2026-05-05 (pfc.txt was empty in upstream because these two
+		// TraceConnectWithoutContext calls were commented out). 2026-05-10
+		// SONiC expansion: switch from "QbbPfc" (single-arg type) to
+		// "QbbPfcQ" (per-priority: type, qIndex). Old QbbPfc trace stays
+		// available on the device for upstream callers; this example
+		// uses the per-priority form to populate pfc.txt with qIndex.
+		DynamicCast<QbbNetDevice>(d.Get(0))->TraceConnectWithoutContext("QbbPfcQ", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(0))));
+		DynamicCast<QbbNetDevice>(d.Get(1))->TraceConnectWithoutContext("QbbPfcQ", MakeBoundCallback (&get_pfc, pfc_file, DynamicCast<QbbNetDevice>(d.Get(1))));
 	}
 
 	nic_rate = get_nic_rate(n);
@@ -992,20 +1042,24 @@ int main(int argc, char *argv[])
 			uint64_t totalHeadroom = 0;
 			for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
 
-				// Wire per-port counter trace callbacks (Stage 5a-realistic).
-				// Hooks QbbEnqueue/QbbDequeue/QbbDrop on each switch port so
-				// rx/tx packets+bytes, drops, and queue-depth peak accumulate
-				// in the side maps for end-of-sim emission to counters.txt.
+				// Wire per-port-per-queue counter trace callbacks
+				// (Stage 5a-realistic SONiC expansion 2026-05-10). Hooks
+				// QbbEnqueue / QbbDequeue / QbbDrop on each switch port; the
+				// callbacks key the side maps by (switch_id, if_index, qIndex)
+				// so per-priority queue volumetrics + drops accumulate
+				// alongside the periodic egress-qlen / ingress-PG watermark
+				// samples. counters.txt becomes per-(switch, port, queue)
+				// rather than per-(switch, port).
 				{
 					Ptr<QbbNetDevice> port_dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
 					uint32_t sw_id = sw->GetId();
 					uint32_t if_idx = port_dev->GetIfIndex();
 					port_dev->TraceConnectWithoutContext("QbbEnqueue",
-						MakeBoundCallback(&on_port_enqueue, sw_id, if_idx, port_dev));
+						MakeBoundCallback(&on_portq_enqueue, sw_id, if_idx));
 					port_dev->TraceConnectWithoutContext("QbbDequeue",
-						MakeBoundCallback(&on_port_dequeue, sw_id, if_idx));
+						MakeBoundCallback(&on_portq_dequeue, sw_id, if_idx));
 					port_dev->TraceConnectWithoutContext("QbbDrop",
-						MakeBoundCallback(&on_port_drop, sw_id, if_idx));
+						MakeBoundCallback(&on_portq_drop, sw_id, if_idx));
 				}
 
 				for (uint32_t qu = 0; qu < 8; qu++) {
@@ -1190,27 +1244,42 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	// Schedule the per-(switch, port, queue) watermark sampler. Walks every
+	// switch's MMU every WATERMARK_SAMPLE_NS (100us by default), updating
+	// per-priority egress queue and ingress PG buffer-occupancy peaks for
+	// the SONiC-shaped counters.txt rollup. Stage 5a-realistic, 2026-05-10.
+	Simulator::Schedule(NanoSeconds(WATERMARK_SAMPLE_NS), &sample_watermarks, &n);
+
 	std::cout << "Running Simulation.\n";
 	NS_LOG_INFO("Run Simulation.");
 	Simulator::Stop(Seconds(simulator_stop_time));
 	Simulator::Run();
 
-	// Emit per-port counter rollup (Stage 5a-realistic). One row per (switch,
-	// port) observed during simulation. Columns: switch_id if_index rx_packets
-	// rx_bytes tx_packets tx_bytes drops qlen_peak_bytes. Only switch ports
-	// emit counters (host ports are filtered out at trace-connect time).
+	// Emit per-(switch, port, queue) counter rollup as counters.txt
+	// (Stage 5a-realistic SONiC expansion 2026-05-10). One row per
+	// (switch, port, queue) observed during simulation. Columns:
+	//   switch_id if_index q_index rx_packets rx_bytes tx_packets
+	//   tx_bytes dropped_packets qlen_peak_bytes pg_watermark_bytes
+	// Switch ports only (host ports filtered out at trace-connect time).
+	// Per-queue rather than per-port: matches SONiC's `show queue
+	// counters` + `show queue watermark` + `show priority-group
+	// watermark` per-priority breakdown. Aggregates across queues are
+	// deliberately NOT emitted — Doppelgänger forces the agent to sum
+	// queues themselves (pre-aggregation is itself a skill).
 	{
-		std::set<std::pair<uint32_t, uint32_t>> keys;
-		for (auto& kv : port_rx_packets) keys.insert(kv.first);
-		for (auto& kv : port_tx_packets) keys.insert(kv.first);
-		for (auto& kv : port_drops) keys.insert(kv.first);
-		for (auto& kv : port_qlen_peak_bytes) keys.insert(kv.first);
+		std::set<PortQKey> keys;
+		for (auto& kv : portq_rx_packets) keys.insert(kv.first);
+		for (auto& kv : portq_tx_packets) keys.insert(kv.first);
+		for (auto& kv : portq_drops) keys.insert(kv.first);
+		for (auto& kv : portq_qlen_peak_bytes) keys.insert(kv.first);
+		for (auto& kv : portq_pg_watermark_bytes) keys.insert(kv.first);
 		for (auto& k : keys) {
-			fprintf(counters_file, "%u %u %lu %lu %lu %lu %lu %lu\n",
-				k.first, k.second,
-				port_rx_packets[k], port_rx_bytes[k],
-				port_tx_packets[k], port_tx_bytes[k],
-				port_drops[k], port_qlen_peak_bytes[k]);
+			fprintf(counters_file, "%u %u %u %lu %lu %lu %lu %lu %lu %lu\n",
+				std::get<0>(k), std::get<1>(k), std::get<2>(k),
+				portq_rx_packets[k], portq_rx_bytes[k],
+				portq_tx_packets[k], portq_tx_bytes[k],
+				portq_drops[k],
+				portq_qlen_peak_bytes[k], portq_pg_watermark_bytes[k]);
 		}
 		fflush(counters_file);
 		fclose(counters_file);

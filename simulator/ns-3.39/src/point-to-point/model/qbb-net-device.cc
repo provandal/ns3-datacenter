@@ -237,6 +237,12 @@ QbbNetDevice::GetTypeId(void)
 	                                     MakeTraceSourceAccessor (&QbbNetDevice::m_traceQpDequeue), "ns3::Packet::TracedCallback")
 	                    .AddTraceSource ("QbbPfc", "get a PFC packet. 0: resume, 1: pause",
 	                                     MakeTraceSourceAccessor (&QbbNetDevice::m_tracePfc), "ns3::Packet::TracedCallback")
+	                    .AddTraceSource ("QbbPfcQ",
+	                                     "PFC frame event with per-priority qIndex. "
+	                                     "Args: type (0=resume_rcvd, 1=pause_rcvd, "
+	                                     "2=pause_sent, 3=resume_sent), qIndex.",
+	                                     MakeTraceSourceAccessor (&QbbNetDevice::m_tracePfcQ),
+	                                     "ns3::QbbNetDevice::PfcQTracedCallback")
 	                    ;
 
 	return tid;
@@ -509,9 +515,11 @@ QbbNetDevice::Receive(Ptr<Packet> packet)
 		unsigned qIndex = ch.pfc.qIndex;
 		if (ch.pfc.time > 0) {
 			m_tracePfc(1);
+			m_tracePfcQ(1, qIndex);
 			m_paused[qIndex] = true;
 		} else {
 			m_tracePfc(0);
+			m_tracePfcQ(0, qIndex);
 			Resume(qIndex);
 		}
 	} else { // non-PFC packets (data, ACK, NACK, CNP...)
@@ -610,6 +618,7 @@ void QbbNetDevice::SendPfc(uint32_t qIndex, uint32_t type) {
 	CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
 	p->PeekHeader(ch);
 	m_tracePfc(type+2); // 2 indicates PFC PAUSE sent.3 indicates RESUME sent
+	m_tracePfcQ(type+2, qIndex);
 	SwitchSend(0, p, ch);
 }
 

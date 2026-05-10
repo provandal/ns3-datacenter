@@ -146,6 +146,13 @@ public:
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDequeue;
 	TracedCallback<Ptr<const Packet>, uint32_t> m_traceDrop;
 	TracedCallback<uint32_t> m_tracePfc; // 0: resume, 1: pause
+	// Per-priority PFC trace, fired alongside m_tracePfc with the
+	// pause/resume frame's 802.1p priority (qIndex). Keeps the old
+	// m_tracePfc signature stable for upstream callers (other examples
+	// subscribe via "QbbPfc"); new code subscribes to "QbbPfcQ" when
+	// per-priority is needed. Provandal/ns3-datacenter HarnessIT
+	// Stage 5a-realistic SONiC counter expansion, 2026-05-10.
+	TracedCallback<uint32_t, uint32_t> m_tracePfcQ;
 	uint64_t getTxBytes(){
 				uint64_t temp=numTxBytes;
 				numTxBytes=0;
