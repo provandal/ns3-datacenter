@@ -62,6 +62,16 @@ std::string counters_output_file = "counters.txt";
 // scheduled but never completed.
 std::string intended_output_file = "intended.txt";
 FILE *intended_file = NULL;
+// 2026-05-12 (step 2b): host-ingress PHY drop counters. RateErrorModel
+// is attached as the ReceiveErrorModel on every QbbNetDevice; when a
+// packet is corrupted, the receiving device fires PhyRxDrop. We
+// subscribe only on host-side NICs (sourceNodes) so this file
+// surfaces drops that flows experienced on their inbound link — the
+// SRE-visible signature of link-layer silent drops. Switch-side
+// admission drops already live in counters.txt's dropped_packets.
+std::string host_counters_output_file = "host_counters.txt";
+// Per-host PHY-rx drop counters: host_id -> if_index -> count.
+std::map<uint32_t, std::map<uint32_t, uint64_t> > host_phy_rx_drops;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -155,6 +165,15 @@ uint32_t flow_num;
 // Forward declaration so ReadFlowInput can call node_id_to_ip; the
 // definition lives further down with the other helper functions.
 Ipv4Address node_id_to_ip(uint32_t id);
+
+// 2026-05-12 (step 2b): host-side PhyRxDrop callback. Fires when a
+// packet arriving at a host NIC is dropped by the receive-side
+// RateErrorModel (silent drops at link_error_rate). The bound args
+// host_id + if_idx identify the receiving host's interface.
+void on_host_phy_rx_drop(uint32_t host_id, uint32_t if_idx,
+                          ns3::Ptr<const ns3::Packet> /*p*/) {
+	host_phy_rx_drops[host_id][if_idx]++;
+}
 
 void ReadFlowInput() {
 	if (flow_input.idx < flow_num) {
@@ -779,6 +798,9 @@ int main(int argc, char *argv[])
 		} else if (key.compare("INTENDED_OUTPUT_FILE") == 0) {
 			conf >> intended_output_file;
 			std::cout << "INTENDED_OUTPUT_FILE\t\t\t" << intended_output_file << '\n';
+		} else if (key.compare("HOST_COUNTERS_OUTPUT_FILE") == 0) {
+			conf >> host_counters_output_file;
+			std::cout << "HOST_COUNTERS_OUTPUT_FILE\t\t" << host_counters_output_file << '\n';
 		} else if (key.compare("LINK_DOWN") == 0) {
 			conf >> link_down_time >> link_down_A >> link_down_B;
 			std::cout << "LINK_DOWN\t\t\t\t" << link_down_time << ' ' << link_down_A << ' ' << link_down_B << '\n';
@@ -1024,7 +1046,28 @@ int main(int argc, char *argv[])
 
 
 		if (!snode->GetNodeType()) {
-			sourceNodes[src].Add(DynamicCast<QbbNetDevice>(d.Get(0)));
+			Ptr<QbbNetDevice> host_dev_src = DynamicCast<QbbNetDevice>(d.Get(0));
+			sourceNodes[src].Add(host_dev_src);
+			// 2026-05-12 (step 2b): subscribe PhyRxDrop on the host's NIC
+			// so we count packets the host RECEIVES that were corrupted
+			// by the receive-side error model (silent drops at
+			// link_error_rate). Host_dev_src is on the host-end of the
+			// host↔leaf link; it receives downstream traffic destined
+			// for this host.
+			uint32_t host_src_if = host_dev_src->GetIfIndex();
+			host_dev_src->TraceConnectWithoutContext(
+				"PhyRxDrop",
+				MakeBoundCallback(&on_host_phy_rx_drop, src, host_src_if));
+		}
+		// Symmetric subscription on the destination side if it's a host.
+		// A host receives traffic regardless of whether it sits at the
+		// link's "src" or "dst" endpoint in the topology file.
+		if (!dnode->GetNodeType()) {
+			Ptr<QbbNetDevice> host_dev_dst = DynamicCast<QbbNetDevice>(d.Get(1));
+			uint32_t host_dst_if = host_dev_dst->GetIfIndex();
+			host_dev_dst->TraceConnectWithoutContext(
+				"PhyRxDrop",
+				MakeBoundCallback(&on_host_phy_rx_drop, dst, host_dst_if));
 		}
 
 		if (!snode->GetNodeType() && dnode->GetNodeType()) {
@@ -1323,6 +1366,25 @@ int main(int argc, char *argv[])
 		}
 		fflush(counters_file);
 		fclose(counters_file);
+	}
+
+	// 2026-05-12 (step 2b): emit per-host PHY-rx drop counts. One row
+	// per (host_id, if_index) that registered any drops; absent rows
+	// mean zero drops (Doppelgänger zero-fills from topology, same
+	// pattern as get_fabric_counters).
+	//   Columns: host_id if_index drop_packets
+	{
+		FILE *host_file = fopen(host_counters_output_file.c_str(), "w");
+		if (host_file != NULL) {
+			for (auto& host_kv : host_phy_rx_drops) {
+				for (auto& if_kv : host_kv.second) {
+					fprintf(host_file, "%u %u %lu\n",
+						host_kv.first, if_kv.first, if_kv.second);
+				}
+			}
+			fflush(host_file);
+			fclose(host_file);
+		}
 	}
 
 	Simulator::Destroy();
