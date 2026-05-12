@@ -56,6 +56,12 @@ std::string fct_output_file = "fct.txt";
 std::string pfc_output_file = "pfc.txt";
 std::string ecn_output_file = "ecn.txt";
 std::string counters_output_file = "counters.txt";
+// 2026-05-12: intended-flow dump for Doppelgänger v0.2 §4.2 incomplete-flow
+// surfacing. Written once per flow at read time so an end-of-sim
+// cross-reference against fct.txt can identify flows that were
+// scheduled but never completed.
+std::string intended_output_file = "intended.txt";
+FILE *intended_file = NULL;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -146,11 +152,32 @@ struct FlowInput {
 FlowInput flow_input = {0};
 uint32_t flow_num;
 
+// Forward declaration so ReadFlowInput can call node_id_to_ip; the
+// definition lives further down with the other helper functions.
+Ipv4Address node_id_to_ip(uint32_t id);
+
 void ReadFlowInput() {
 	if (flow_input.idx < flow_num) {
 		flowf >> flow_input.src >> flow_input.dst >> flow_input.pg >> flow_input.dport >> flow_input.maxPacketCount >> flow_input.start_time;
 		std::cout << "Flow " << flow_input.src << " " << flow_input.dst << " " << flow_input.pg << " " << flow_input.dport << " " << flow_input.maxPacketCount << " " << flow_input.start_time << " " << Simulator::Now().GetSeconds() << std::endl;
 		NS_ASSERT(n.Get(flow_input.src)->GetNodeType() == 0 && n.Get(flow_input.dst)->GetNodeType() == 0);
+		// 2026-05-12: write one row to intended.txt per scheduled flow.
+		// Format: sip_hex dip_hex dport packets start_ns (5 columns).
+		// sip/dip computed via node_id_to_ip so the hex form matches
+		// fct.txt's sip/dip columns exactly (Doppelgänger cross-references
+		// by (sip, dip, dport) tuple). sport is intentionally omitted —
+		// the substrate assigns it at schedule time, after ReadFlowInput;
+		// incomplete flows that never schedule never get a sport, so the
+		// match key has to exclude it.
+		if (intended_file != NULL) {
+			uint32_t sip_v = node_id_to_ip(flow_input.src).Get();
+			uint32_t dip_v = node_id_to_ip(flow_input.dst).Get();
+			uint64_t start_ns = (uint64_t)(flow_input.start_time * 1e9);
+			fprintf(intended_file, "%08x %08x %lu %lu %lu\n",
+			        sip_v, dip_v, flow_input.dport,
+			        flow_input.maxPacketCount, start_ns);
+			fflush(intended_file);
+		}
 	}
 }
 void ScheduleFlowInputs() {
@@ -170,6 +197,12 @@ void ScheduleFlowInputs() {
 		Simulator::Schedule(Seconds(flow_input.start_time) - Simulator::Now(), ScheduleFlowInputs);
 	} else { // no more flows, close the file
 		flowf.close();
+		// 2026-05-12: all intended flows have been written to intended.txt;
+		// close so the file is flushed before sim end.
+		if (intended_file != NULL) {
+			fclose(intended_file);
+			intended_file = NULL;
+		}
 	}
 }
 
@@ -743,6 +776,9 @@ int main(int argc, char *argv[])
 		} else if (key.compare("COUNTERS_OUTPUT_FILE") == 0) {
 			conf >> counters_output_file;
 			std::cout << "COUNTERS_OUTPUT_FILE\t\t\t" << counters_output_file << '\n';
+		} else if (key.compare("INTENDED_OUTPUT_FILE") == 0) {
+			conf >> intended_output_file;
+			std::cout << "INTENDED_OUTPUT_FILE\t\t\t" << intended_output_file << '\n';
 		} else if (key.compare("LINK_DOWN") == 0) {
 			conf >> link_down_time >> link_down_A >> link_down_B;
 			std::cout << "LINK_DOWN\t\t\t\t" << link_down_time << ' ' << link_down_A << ' ' << link_down_B << '\n';
@@ -934,6 +970,10 @@ int main(int argc, char *argv[])
 	FILE *pfc_file = fopen(pfc_output_file.c_str(), "w");
 	FILE *ecn_file = fopen(ecn_output_file.c_str(), "w");
 	FILE *counters_file = fopen(counters_output_file.c_str(), "w");
+	// 2026-05-12: intended-flow dump; ReadFlowInput writes one row per
+	// scheduled flow so Doppelgänger can cross-reference against fct.txt
+	// to surface flows that were intended but never completed.
+	intended_file = fopen(intended_output_file.c_str(), "w");
 
 	QbbHelper qbb;
 	Ipv4AddressHelper ipv4;
