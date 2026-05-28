@@ -505,6 +505,20 @@ QbbNetDevice::Receive(Ptr<Packet> packet)
 		return;
 	}
 
+	// 2026-05-28: fire PhyRxEnd uniformly here, BEFORE the
+	// TCP-vs-RoCE protocol split below. The original code only fires
+	// m_phyRxEndTrace inside the TCP branch (around the snifferTrace
+	// calls further down), so RoCEv2 packets never increment the
+	// PhyRxEnd count — even though they pass the error-model check
+	// at the same point as TCP. PhyRxDrop fires uniformly above for
+	// any corrupted packet; PhyRxEnd is now its symmetric
+	// counterpart for any non-corrupted packet, regardless of
+	// upper-layer protocol. Without this, the host-NIC PhyRxEnd
+	// subscription in examples/PowerTCP/powertcp-evaluation-burst.cc
+	// reports rx_packets=0 even on hosts that received thousands of
+	// RoCE packets, making the silent-drops denominator unusable.
+	m_phyRxEndTrace(packet);
+
 	m_macRxTrace(packet);
 
 	CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
@@ -535,7 +549,9 @@ QbbNetDevice::Receive(Ptr<Packet> packet)
 			if (ih.GetProtocol() == 0x06) {
 				m_snifferTrace (packet);
 				m_promiscSnifferTrace (packet);
-				m_phyRxEndTrace (packet);
+				// m_phyRxEndTrace was here pre-2026-05-28; it now
+				// fires uniformly earlier in the function so RoCE
+				// packets are counted symmetrically with TCP.
 				Ptr<Packet> originalPacket = packet->Copy ();
 				uint16_t prot = 0;
 				ProcessHeader (packet, prot);
