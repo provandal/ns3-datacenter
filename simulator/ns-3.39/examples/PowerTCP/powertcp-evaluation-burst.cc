@@ -69,9 +69,22 @@ FILE *intended_file = NULL;
 // surfaces drops that flows experienced on their inbound link — the
 // SRE-visible signature of link-layer silent drops. Switch-side
 // admission drops already live in counters.txt's dropped_packets.
+//
+// 2026-05-28: PhyRxEnd added as the symmetric counterpart so the
+// adapter can surface per-host rx_packets alongside rx_drops.
+// Without rx_packets the agent could not distinguish "host received
+// many packets without drops" from "host received zero packets so
+// has no drop signal" — both surface as drop_packets=0. PhyRxEnd
+// fires once per packet that successfully traverses PHY-level rx;
+// PhyRxDrop fires when the RateErrorModel corrupts the packet.
+// These are mutually exclusive per arriving packet, so
+// rx_packets = PhyRxEnd count and rx_drops = PhyRxDrop count.
 std::string host_counters_output_file = "host_counters.txt";
 // Per-host PHY-rx drop counters: host_id -> if_index -> count.
 std::map<uint32_t, std::map<uint32_t, uint64_t> > host_phy_rx_drops;
+// Per-host PHY-rx successful-receive counters (2026-05-28): same
+// shape as the drop map; rows live together in host_counters.txt.
+std::map<uint32_t, std::map<uint32_t, uint64_t> > host_phy_rx_packets;
 
 double alpha_resume_interval = 55, rp_timer, ewma_gain = 1 / 16;
 double rate_decrease_interval = 4;
@@ -173,6 +186,20 @@ Ipv4Address node_id_to_ip(uint32_t id);
 void on_host_phy_rx_drop(uint32_t host_id, uint32_t if_idx,
                           ns3::Ptr<const ns3::Packet> /*p*/) {
 	host_phy_rx_drops[host_id][if_idx]++;
+}
+
+// 2026-05-28: symmetric callback for successful PHY-level receive.
+// Fires once per packet that the receive-side error model passes
+// cleanly to the MAC layer; together with on_host_phy_rx_drop this
+// gives the adapter the denominator (rx_packets) it needs to
+// distinguish "received N packets, dropped 0" from "received 0
+// packets, dropped 0 because there was nothing to drop." Without
+// this denominator, hosts that simply weren't receivers in the
+// workload look identical to perfectly-healthy receivers in the
+// adapter's host counter response.
+void on_host_phy_rx_end(uint32_t host_id, uint32_t if_idx,
+                         ns3::Ptr<const ns3::Packet> /*p*/) {
+	host_phy_rx_packets[host_id][if_idx]++;
 }
 
 void ReadFlowInput() {
@@ -1054,10 +1081,15 @@ int main(int argc, char *argv[])
 			// link_error_rate). Host_dev_src is on the host-end of the
 			// host↔leaf link; it receives downstream traffic destined
 			// for this host.
+			// 2026-05-28: PhyRxEnd added in parallel for the rx_packets
+			// denominator (see comment block on host_phy_rx_packets).
 			uint32_t host_src_if = host_dev_src->GetIfIndex();
 			host_dev_src->TraceConnectWithoutContext(
 				"PhyRxDrop",
 				MakeBoundCallback(&on_host_phy_rx_drop, src, host_src_if));
+			host_dev_src->TraceConnectWithoutContext(
+				"PhyRxEnd",
+				MakeBoundCallback(&on_host_phy_rx_end, src, host_src_if));
 		}
 		// Symmetric subscription on the destination side if it's a host.
 		// A host receives traffic regardless of whether it sits at the
@@ -1068,6 +1100,9 @@ int main(int argc, char *argv[])
 			host_dev_dst->TraceConnectWithoutContext(
 				"PhyRxDrop",
 				MakeBoundCallback(&on_host_phy_rx_drop, dst, host_dst_if));
+			host_dev_dst->TraceConnectWithoutContext(
+				"PhyRxEnd",
+				MakeBoundCallback(&on_host_phy_rx_end, dst, host_dst_if));
 		}
 
 		if (!snode->GetNodeType() && dnode->GetNodeType()) {
@@ -1368,19 +1403,54 @@ int main(int argc, char *argv[])
 		fclose(counters_file);
 	}
 
-	// 2026-05-12 (step 2b): emit per-host PHY-rx drop counts. One row
-	// per (host_id, if_index) that registered any drops; absent rows
-	// mean zero drops (Doppelgänger zero-fills from topology, same
-	// pattern as get_fabric_counters).
-	//   Columns: host_id if_index drop_packets
+	// 2026-05-12 (step 2b) + 2026-05-28: emit per-host PHY-rx counters.
+	// One row per (host_id, if_index) that registered any PhyRx event
+	// (drop OR successful end). Absent rows mean the host's NIC saw
+	// no PHY-level rx traffic in this run — Doppelgänger zero-fills
+	// from topology if needed, same pattern as get_fabric_counters.
+	//   Columns: host_id if_index drop_packets rx_packets
+	// rx_packets is the denominator (PhyRxEnd count) that lets the
+	// adapter surface "drops out of N received" rather than just
+	// "drops." Without it, hosts that simply weren't receivers in
+	// the workload look identical to perfectly-healthy receivers.
 	{
 		FILE *host_file = fopen(host_counters_output_file.c_str(), "w");
 		if (host_file != NULL) {
+			// Build the union of keys across drops and rx_packets so
+			// we emit a row for any host_iface that saw either kind
+			// of PhyRx event.
+			std::set<std::pair<uint32_t, uint32_t> > keys;
 			for (auto& host_kv : host_phy_rx_drops) {
 				for (auto& if_kv : host_kv.second) {
-					fprintf(host_file, "%u %u %lu\n",
-						host_kv.first, if_kv.first, if_kv.second);
+					keys.insert({host_kv.first, if_kv.first});
 				}
+			}
+			for (auto& host_kv : host_phy_rx_packets) {
+				for (auto& if_kv : host_kv.second) {
+					keys.insert({host_kv.first, if_kv.first});
+				}
+			}
+			for (auto& k : keys) {
+				uint32_t host_id = k.first;
+				uint32_t if_idx = k.second;
+				uint64_t drops = 0;
+				auto dh = host_phy_rx_drops.find(host_id);
+				if (dh != host_phy_rx_drops.end()) {
+					auto di = dh->second.find(if_idx);
+					if (di != dh->second.end()) {
+						drops = di->second;
+					}
+				}
+				uint64_t pkts = 0;
+				auto rh = host_phy_rx_packets.find(host_id);
+				if (rh != host_phy_rx_packets.end()) {
+					auto ri = rh->second.find(if_idx);
+					if (ri != rh->second.end()) {
+						pkts = ri->second;
+					}
+				}
+				fprintf(host_file, "%u %u %lu %lu\n",
+					host_id, if_idx, drops, pkts);
 			}
 			fflush(host_file);
 			fclose(host_file);
